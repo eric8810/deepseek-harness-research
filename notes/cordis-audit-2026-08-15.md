@@ -1,0 +1,150 @@
+# Vendored Cordis 多方向安全审查与技术审计报告
+
+> 2026-08-15,六个 glm-5.3 agent 并行只读审计的方向性汇总。审计对象:`vendor/{cordis,loader,include,group,timer,hmr,logger-console,cosmokit,schemastery}`;上游对照:`~/repos/cordis-workspace`(cordiverse/cordis)。所有发现均带 file:line 证据;标注「待验证」的项未做端到端复现。未修改任何文件。
+
+## 威胁模型
+
+- **设计前提**:Cordis 按「同域插件可信」运行——拿到 ctx 的插件本就等同进程内任意 JS。同域类发现的价值在纵深防御与 fail-loud,而非堵「恶意插件」。
+- **真实不可信边界**:harness 侧 [cordis-host-runner](../../packages/extensions/cordis-host-runner/src/guard.ts) 的 vm realm + 白名单 façade(拒绝 `root/reflect/registry/fiber/extend/isolate/intercept/set/mixin`),已验证有效封堵大多数同域原语。
+- **配置作者 = 代码作者**:`!!js` 全权限求值是明示设计(AGENTS.md);缺口在受限 profile 下「模型经 fs 工具写工作区配置」的提权路径。
+
+## 发现汇总(按严重度)
+
+### Critical
+
+**C1. 包装 fiber 句柄上的 `restart()`/`update()` 使生命周期状态机脱同步(补丁 #6 引入的回归)**
+[vendor/cordis/src/fiber.ts:718-753](../../vendor/cordis/src/fiber.ts#L718-L753)、[registry.ts:330-335](../../vendor/cordis/src/registry.ts#L330-L335)
+`ctx.plugin()` 返回 `Object.create(fiber)` 包装对象;vendored 的 `restart()/update()` 直接在 `this` 上写 `state/inertia/config/_config/_error`,全部变成包装对象自有属性,**遮蔽**真实 fiber。上游用 `this.ctx.fiber` 重锚定,补丁丢掉了这一步。实测后果:`await fiber` 提前 resolve;被拒 update 污染后续 reload;UNLOADING 检查被绕过(补丁 #6 声称关闭的洞被重新打开);并发时插件执行 3 次、teardown 仅 1 次。**loader 配置刷新路径直接命中**([entry.ts:296](../../vendor/loader/src/config/entry.ts#L296) 的 `Entry.fiber` 就是包装对象)。修复:恢复 `this.ctx.fiber` 重锚定。端到端 HMR 表现待验证(机制已实证)。
+
+### High
+
+**H1. `emit` 丢弃异步监听器 rejection → dsh 宿主下进程退出**
+[vendor/cordis/src/events.ts:194-196](../../vendor/cordis/src/events.ts#L194-L196)(两个 agent 独立发现)
+`emit` 对返回的 Promise 不做处理;dsh 宿主 `installFailLoud` 把一切 unhandledRejection 视为 fatal `exit(1)`([app-boot/src/index.ts:615-648](../../packages/boot/app-boot/src/index.ts#L615-L648))。任一插件 async 监听器抛错 = 整个进程崩溃,错误归属错位。对照:框架对 `internal/plugin` 已有逐回调隔离(`emitPluginDisposed`),唯 `emit` 裸奔。修复:对 thenable 挂 `.catch` 路由到 logger。
+
+**H2. 抛错的 `internal/status` 观察者会跳过依赖通知并污染 `await`**
+[vendor/cordis/src/fiber.ts:586](../../vendor/cordis/src/fiber.ts#L586)(两个 agent 独立发现)
+`_updateState` 先 emit `internal/status`(无隔离)再 `reflect.notify`;观察者抛错穿出 → 提供者已 ACTIVE 但依赖者永久 PENDING,`await fiber` 以观察者错误 reject。`ctx.plugin()` 在构造器激活块([fiber.ts:314-319](../../vendor/cordis/src/fiber.ts#L314-L319))也会同步抛出且子 fiber 仍存活加载。修复:对该 emit 采用逐回调 try/catch。
+
+**H3. 根上下文任意自有属性写入可静默遮蔽任意服务(同域)**
+[vendor/cordis/src/reflect.ts:181](../../vendor/cordis/src/reflect.ts#L181)
+set 陷阱对 root fiber(`!ctx.fiber.runtime`)直接 `Reflect.set`:任何持有 `ctx.root` 的插件可 `ctx.root.database = fake`,之后真 provider 注册也被遮蔽(get 的 `Reflect.has` 分支优先于服务解析),绕过 inject/隔离/所有权检查。`ctx.root.fiber = fake` 同理可打断全部生命周期。失败全程静默。
+
+**H4. `internal/get|set|config` 是进程级全局钩子(同域,设计能力)**
+[reflect.ts:153](../../vendor/cordis/src/reflect.ts#L153)、[reflect.ts:191](../../vendor/cordis/src/reflect.ts#L191)、[fiber.ts:641-644](../../vendor/cordis/src/fiber.ts#L641-L644)
+任一插件监听 `internal/config` 即可读取/改写其它所有插件经校验的配置;`internal/get` 可替换任意服务解析。不可信插件模型下等同全局中间人。若需支持不可信插件,应限定 internal/* 仅根 fiber 可注册。
+
+### Medium
+
+**M1. `!!js` 求值:`new Function` + `with(ctx){eval}` 全权限,受限 profile 下的持久化提权通道**
+[vendor/loader/src/config/utils.ts:5-9](../../vendor/loader/src/config/utils.ts#L5-L9)
+无沙箱、无 allowlist,先于 schema 校验执行;经 `({}).constructor.constructor('return process')()` 可逃逸到完整宿主。信任等式「配置作者=代码作者」被 fs 沙箱 workspace-write 打破:模型可写工作区 `cordis.yml`,HMR 配置刷新([hmr/src/index.ts:244-254](../../vendor/hmr/src/index.ts#L244-L254))无需重启即触发。修复:受限 profile 提供「拒绝 `!!js`」的 schema 变体。
+
+**M2. Schemastery「schema JSON 即代码」latent RCE**
+[vendor/schemastery/src/index.ts:258-262](../../vendor/schemastery/src/index.ts#L258-L262)
+字符串 `callback` 经 `new Function('return ' + src)()` 在构造瞬间执行。当前唯一消费面(apiproxy → client schema-form)是进程内可信序列化,**无可达的不可信输入路径**;任何未来外部 schema 来源会静默继承 RCE。
+
+**M3. `update()` 校验前暂存 `_config`,被拒更新污染后续自然 reload(补丁 #15 引入)**
+[vendor/cordis/src/fiber.ts:738](../../vendor/cordis/src/fiber.ts#L738)
+`update('BAD')` 抛 ValidationError 后,依赖驱动的 reload 消费被污染的 `_config` 再抛同错 → fiber FAILED。修复:校验成功后再写。
+
+**M4. LOADING 窗口内 `update()/restart()` 因 epoch 翻转丢失**
+[vendor/cordis/src/fiber.ts:625-639](../../vendor/cordis/src/fiber.ts#L625-L639)
+`_setEpoch(INACTIVE)` 后紧跟 `_refresh()` 把 epoch 翻回,`if (this.inertia) return` 抹掉 INACTIVE 标记;异步启动窗口内的更新永不生效。restart 部分为上游既有,补丁 #15 的 defer 路径放大到暂存配置。
+
+**M5. `reflect.store`/`fiber.store` 公开可变,直改绕过所有权检查(同域)**
+[reflect.ts:209](../../vendor/cordis/src/reflect.ts#L209)、[reflect.ts:116-125](../../vendor/cordis/src/reflect.ts#L116-L125)
+`ctx.reflect.store[label].value = evil` 或改 `impl.fiber` 伪造所有权,完全绕过 `ctx.set` 检查。修复:`Impl` 内部化,store 暴露只读视图。
+
+**M6. symbol/`_`前缀写直通:isolate/intercept 映射可整体替换;`__proto__` 劫持根原型(同域)**
+[reflect.ts:174-176](../../vendor/cordis/src/reflect.ts#L174-L176)、[context.ts:72-73](../../vendor/cordis/src/context.ts#L72-L73)
+`ctx.root[symbols.intercept] = forgedMap` → 可给 LLM 服务注入 `baseURL` 重定向流量;`ctx.__proto__ = X` 劫持 `Context.prototype`。全局 `Object.prototype` 污染已验证**不存在**(所有 dict 均 null-proto)。
+
+**M7. `Symbol.for('cordis.tracker'/'cordis.shadow')` 无密钥可伪造——唯一不依赖插件身份的发现**
+[utils.ts:117-125](../../vendor/cordis/src/utils.ts#L117-L125)、[utils.ts:174-182](../../vendor/cordis/src/utils.ts#L174-L182)
+污染一个将来流经 `ctx.get`/inject 解析的对象(预设 tracker/shadow 标记)即可注入内泄元数据(`db.fiber` 返回消费方 Fiber)或对象替换。**npm 依赖供应链不可信场景下独立成立**。修复:改模块内 `Symbol()`。
+
+**M8. accessor/provide 名字抢注:先到先得,可劫持任意未加载服务(同域)**
+[reflect.ts:345-353](../../vendor/cordis/src/reflect.ts#L345-L353)
+先 `ctx.accessor('database', {get: () => fake})`,真 provider 之后 `provide` 抛错,消费方全拿 fake。
+
+**M9. Logger 递归解包 cause/AggregateError 无环检测**
+[logger.ts:143-149](../../vendor/cordis/src/logger.ts#L143-L149)
+`e.cause = e` → RangeError 栈溢出;外部数据构造的错误对象可达成(不可信输入面)。修复:深度上限或 visited 集合。
+
+**M10. HMR `refreshConfig` dirty 循环无退避/无上限**
+[hmr/src/index.ts:297-324](../../vendor/hmr/src/index.ts#L297-L324)
+外部持续 touch 即驱动全量 read+parse+事务循环(每事件一轮);非幂等写回则紧密循环(yaml.dump 往返稳定性待验证)。
+
+**M11. `parallel` 向 `internal/dispatch` 上报 `'emit'`;JSDoc 声称 resolve 实则 reject**
+[events.ts:184](../../vendor/cordis/src/events.ts#L184)、[events.ts:37-46](../../vendor/cordis/src/events.ts#L37-L46)
+`DispatchMode` 的 `'parallel'` 是死值;harness invariant 插件无法区分。错误契约:`AggregateError(errors[].reason)` 未声明。
+
+**M12. `bail` 把 Promise 本身当 bail 值;async `internal/listener` 使 `on()` 返回非函数**
+[events.ts:217-222](../../vendor/cordis/src/events.ts#L217-L222)
+上层 `ui-commands` 以 `bail(...) === true` 严格判等,async 监听器会静默破坏;`on()` 返回 Promise 当 disposer,调用即 TypeError。
+
+**M13. symbol 事件名可注册但分发即 TypeError**
+[events.ts:288](../../vendor/cordis/src/events.ts#L288) vs [events.ts:168](../../vendor/cordis/src/events.ts#L168)
+`on(sym)` 后 `emit(sym)` → `name.startsWith is not a function`。
+
+**M14. `Fiber.update` 非 ACTIVE 分支:返回 undefined、跳过 waterfall 与验证,与 JSDoc 相符性破裂**
+[fiber.ts:725-753](../../vendor/cordis/src/fiber.ts#L725-L753)
+PENDING 纤维上 update 静默绕过 `internal/update` 钩子,校验错误不抛。
+
+### Low(择要)
+
+| # | 发现 | 位置 |
+|---|---|---|
+| L1 | `internal/listener` 声明参数与实际载荷不符(boolean vs EventOptions) | [events.ts:348](../../vendor/cordis/src/events.ts#L348) |
+| L2 | `on/once` disposer 返回值与 JSDoc 相反(声明 boolean,实为 void) | [events.ts:95-97](../../vendor/cordis/src/events.ts#L95-L97) |
+| L3 | effect disposer await 解析为 undefined,类型却声明 `() => T`;`ctx.plugin()` await 解析为内部 Fiber(身份不等) | [fiber.ts:64-66](../../vendor/cordis/src/fiber.ts#L64-L66) |
+| L4 | `resolveConfig` 拦截链循环走进 null 原型(当前公开 API 不可达,一触即溃) | [service.ts:89-94](../../vendor/cordis/src/service.ts#L89-L94) |
+| L5 | `internal/config` 监听器 throw falsy → 纤维静默回 PENDING,`await` 不抛 | [fiber.ts:641-664](../../vendor/cordis/src/fiber.ts#L641-L664) |
+| L6 | `provide` 不清理 `props`,`'name' in ctx` 永久 true(与 accessor 不对称) | [reflect.ts:279-303](../../vendor/cordis/src/reflect.ts#L279-L303) |
+| L7 | HMR 主 watcher 默认跟随符号链接,监听范围可越出 root | [hmr/src/index.ts:228-240](../../vendor/hmr/src/index.ts#L228-L240) |
+| L8 | Include 写回固定 `.tmp` 名 + 无 `O_EXCL`,同目录可写者可符号链接劫持(写回内容本身无 `!!js` 注入面,已核实) | [include/src/index.ts:332-341](../../vendor/include/src/index.ts#L332-L341) |
+| L9 | Group/Entry 事务回滚失败后运行态与持久化数据分叉;更新窗口新旧 fiber 并存 | [group.ts:70-105](../../vendor/loader/src/config/group.ts#L70-L105) |
+| L10 | Schemastery resolver 表穿透原型链(`type:'toString'` 等命中 Object.prototype) | [schemastery/src/index.ts:464](../../vendor/schemastery/src/index.ts#L464) |
+| L11 | 每次 effect 注册固定捕获两个 Error 栈(高频注册放大) | [utils.ts:284-287](../../vendor/cordis/src/utils.ts#L284-L287) |
+| L12 | traceable proxy 无缓存:每属性读新建 1-2 个 Proxy;`ctx.foo !== ctx.foo` | [utils.ts:117-218](../../vendor/cordis/src/utils.ts#L117-L218) |
+| L13 | `DisposableList.push` 同值两次孤立首个条目 | [utils.ts:14-25](../../vendor/cordis/src/utils.ts#L14-L25) |
+| L14 | `internal/update` + `prepend` + 非 global → `hooks.unshift is not a function`(现有调用方全 global 绕开) | [events.ts:141-144](../../vendor/cordis/src/events.ts#L141-L144) |
+| L15 | UNLOADING 父下 `plugin()` 抛错后幻影 runtime 记录永久残留 | [registry.ts:322-330](../../vendor/cordis/src/registry.ts#L322-L330) |
+| L16 | 同步 setup 失败回滚中 disposer 抛错丢弃其余待回滚项并覆盖原始错误 | [fiber.ts:431](../../vendor/cordis/src/fiber.ts#L431) |
+| L17 | `constructor` 未过滤:可补丁 `Context.prototype`/`Fiber.prototype` | [reflect.ts:140](../../vendor/cordis/src/reflect.ts#L140) |
+| L18 | callable 服务的 `ctx` 字段可变,可重绑定伪造上下文 | [utils.ts:226-233](../../vendor/cordis/src/utils.ts#L226-L233) |
+| L19 | 与 `Object.prototype` 同名的服务(toString/valueOf 等)静默不可达 | [reflect.ts:80-91](../../vendor/cordis/src/reflect.ts#L80-L91) |
+| L20 | HMR `stashed` 竞态丢失 partialReload 运行期间的新变更 | [hmr/src/index.ts:265](../../vendor/hmr/src/index.ts#L265) |
+
+## 供应链与补丁完整性(郑远)
+
+- **18/18 条补丁日志全部确认存在,无虚构**。#6、#15 对应的上游 PR 分支(`feat/reentrant-fiber-lifecycle`、`fix/lazy-entry-config-resolution`)存在但**未合并**;vendor 实现已与分支分叉,未来同步必为冲突合并。
+- **未记录差异**:hmr 的 `@Inject`→`static inject`(行为等价);#7 之外的 JSDoc 增补(timer 5 行、include 56 行等,均 comment-only 已验证);manifest 演进未回写日志(`publishConfig.access` 重新引入、`private: true` 消失、`repository` 恢复——AGENTS.md 的描述已过时);**hmr 以值绑定 import `ModuleLoader` 但未声明依赖**(今日靠 `verbatimModuleSyntax:false` 隐式剔除,是脆弱点)。
+- **版本偏差**:上游 main 领先 9 commits(core rc.8 vs vendor rc.7);7 个功能 commit(logger 级别序互换、dispatch 性能重构、exporter dispose 修复等)均非安全修复;其中 752dbee(`restart/update` 走 `this.ctx.fiber`)**与 C1 直接相关**——上游修复方向正是 vendored 补丁丢失的重锚定。
+- 建议:把「日志穷尽」变成机械 gate(规范化 diff vs 上游 commit);重钉 5 个插件包的 manifest commit 到 cordiverse;补 hmr 类型依赖声明。
+
+## 高频路径评估(吴桐)
+
+| 路径 | 成本 |
+|---|---|
+| 任意 `ctx.prop` 读 | 1-2 个 Proxy 分配 + 原型链 descriptor 查找;热循环中 `ctx.logger.info()` 一行即 2+ 次分配 |
+| 每次事件分发 | dispatch 先跑一轮 `internal/dispatch` 再正式分发(filter/bind 双倍分配) |
+| 每次 effect 注册 | 两个 Error 栈捕获(微秒级,高频注册放大) |
+
+已验证不泄漏的面:effectInertia、fiber._hooks、registry runtime(反复 mount-unmount 同一插件不累积)、HMR watcher 生命周期、timer 全家、logger buffer(有界环形)。
+
+## 修复优先级建议
+
+1. **立即**:C1(恢复 `this.ctx.fiber` 重锚定——上游 752dbee 已示范方向)+ H1(emit 的 thenable catch)+ H2(internal/status 逐回调隔离)。三者都是小改动、高危、有实证复现。
+2. **短期**:M1(受限 profile 拒绝 `!!js`)、M3/M4(update 暂存与 epoch 窗口)、M7(tracker 标记改非注册表 Symbol)、M9(logger 环检测)。
+3. **中期**:供应链项(manifest 重钉、机械 diff gate、hmr 依赖声明)、与上游的移植式同步决策(先推进 #6/#15 的 PR 收敛)。
+4. **记录即可**:同域类的 H3/H4/M5/M6/M8——在「插件可信」前提下是设计接受,价值在文档化能力边界。
+
+## 待验证清单
+
+- C1 在 loader 真实 HMR 场景的端到端表现(机制已实证,时序依赖 Include/HMR 串行化队列)
+- M10 的 yaml.dump 往返稳定性(非幂等写回是否成紧密循环)
+- cosmokit/schemastery 的 fork 快照真实性(上游仓库已删除,无法对照)
+- M2 发现的 cordis-host-runner `guardedService` 浅层守卫是否可达(嵌套内泄对象)
+- `Context.is` 的跨 realm 文档声明与实现不符(fail-closed,无危害)

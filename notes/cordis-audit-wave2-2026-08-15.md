@@ -1,0 +1,112 @@
+# Vendored Cordis 审计第二波:逐文件穷尽 + 二轮对抗(2026-08-15)
+
+> 六个 glm-5.3 agent 的方向性审计(见 [cordis-audit-2026-08-15.md](cordis-audit-2026-08-15.md))之后,本轮七个 agent 补齐了未覆盖文件(cosmokit 整包、group、cordis 入口、timer、logger-console、bin.js)、对 schemastery 做穷尽式逐 resolver 审计、对四大核心文件换新攻击面做二轮对抗,并完成了不可信输入可达性分析。全部只读;动态复现脚本均在 %TEMP%,仓库零改动。
+>
+> **第三波端到端裁决更新**(见文末「端到端裁决」节):C1 现实表现修正为「HMR 模块重载时静默配置回滚」;H1 的 exit() 后果被证伪(缓存混杂保留);H2 在真实 loader 场景不可自然发生(降级为理论项);EMFILE 降级为理论风险;L11/M6 完整链坐实。
+
+## 覆盖矩阵(两波累计)
+
+| 文件 | 第一波 | 第二波 | 状态 |
+|---|---|---|---|
+| cordis/src 9 文件(含 index.ts、bin.js) | ✅ 深审 | ✅ 对抗二轮 + 入口首审 | 穷尽 |
+| cosmokit/src 6 文件 | ❌ 未碰 | ✅ 首次穷尽 | 穷尽 |
+| schemastery/src index.ts(902 行) | ⚠️ 两点 | ✅ 逐 resolver 穷尽 | 穷尽 |
+| loader/src 7 文件 | ✅ | ✅ 对抗二轮(YAML 方言、patch、路径、双实例) | 穷尽 |
+| include、hmr/src | ✅ | ✅ 对抗二轮 | 穷尽 |
+| group/src、timer/src、logger-console/src 3 文件、tsdown 配置 | ❌/⚠️ | ✅ 首审 | 穷尽 |
+| 不可信输入可达性(packages/ 侧) | ❌ | ✅ 红线队 | 完成 |
+
+## 新发现(按严重度)
+
+### High(经端到端修正后)
+
+**W2-H1. Windows 下 HMR 嵌套 ignore 失效(后果修正:缓存混杂,非全量重启)**
+[vendor/hmr/src/index.ts:231](../../vendor/hmr/src/index.ts#L231)
+chokidar v4 函数型 ignored 收到原始 Windows 绝对路径,`relative()` 产出反斜杠相对路径,picomatch 含 `/` 分隔的模式全部失配 → **嵌套** `pkg\node_modules`、`x\.git` 逃逸 ignore(顶层目录级仍生效)。端到端实证:在用模块被逐出 ESM loadCache 但 0 插件重载 → **同进程新旧代码并存,无提示**;`loader.exit()` 不可达(externals 已排除 node_modules)。修复一行:`split(sep).join('/')`。
+
+**W2-H2. epoch 假恢复(降级:理论项)**
+[vendor/cordis/src/fiber.ts:620](../../vendor/cordis/src/fiber.ts#L620)
+组件级可构造(同步 dispose+re-provide 使依赖者永久读旧值),但端到端裁决:真实 loader 的三条替换路径全部正确恢复——provide 清理器删 store 后同步 notify,epoch 必经 INACTIVE,早退条件不可能跨过。仅手工绕过 dispose-notify 偷换 impl 可达。
+
+### Medium-High
+
+**W2-MH1. async-iterator effect 无取消协议:生成器 `finally` 悬挂,内部 await 不结算时 fiber 卸载永久卡死**
+[vendor/cordis/src/fiber.ts:383-395](../../vendor/cordis/src/fiber.ts#L383-L395)、[fiber.ts:511-512](../../vendor/cordis/src/fiber.ts#L511-L512)
+消费循环从不调用 `iter.return()`;effect 销毁必须等循环 promise 自行结算 → 一个生成器停在不可结算的 `await` 上,整棵子树的卸载(含父 fiber)永久 UNLOADING。实测 200ms 后 `unload settled: false`。子证伪:dispose 后 yield 的 disposer 不泄漏(`disposeAfter` 延迟收集,顺序正确)。
+
+**W2-MH2. schemastery `toJSON()` 异常永久毒化进程内全局 refs**
+[vendor/schemastery/src/index.ts:296-307](../../vendor/schemastery/src/index.ts#L296-L307)
+`JSON.stringify` 抛错(BigInt 默认值等)时 refs 复位永不执行,`globalThis.__schemastery_refs__` 保持真值 → 此后**同进程所有** schema 的 toJSON 只返回裸 uid 数字。harness 每个设置命名空间都调 `registration.schema.toJSON()`([settings/src/index.ts:494](../../packages/settings/settings/src/index.ts#L494))——一个坏 schema 毒化整条 settings 序列化路径,进程级不恢复。修复:`try/finally` 复位。
+
+### Medium(择要,共 14 条)
+
+| # | 发现 | 位置 |
+|---|---|---|
+| M1 | `EventsService._hooks` 普通对象:`on('__proto__')`/`on('constructor')`/emit 同名事件「注册即崩、派发即崩」,错误不指向事件名 | [events.ts:132](../../vendor/cordis/src/events.ts#L132) |
+| M2 | dispatch 的 thisArg 无身份校验 + `Symbol.for('cordis.filter')` 可伪造 → 监听器选择性静音、hook.ctx 泄露、emitter DoS | [events.ts:166-173](../../vendor/cordis/src/events.ts#L166-L173) |
+| M3 | 借 `internal/listener` 旁路向任意 fiber 注入 `internal/update` 钩子:无所有权、`getEffects()` 不可见、dispose 后残留 | [events.ts:140-146](../../vendor/cordis/src/events.ts#L140-L146) |
+| M4 | `Object.freeze(ctx)` 后全部 mixin 方法与自有服务属性读取抛 Proxy 不变量 TypeError(冻结父连带毒化全部子) | [reflect.ts:140-142](../../vendor/cordis/src/reflect.ts#L140-L142) |
+| M5 | 嵌套 group 同名局部 id 静默互踩:扁平 `tree.store` + 去重只在单 group 内,跨组偷 entry、误杀活插件、无告警 | [group.ts:22-27](../../vendor/loader/src/config/group.ts#L22-L27) |
+| M6 | 同一文件双 Include:双重挂载 + `.tmp` 固定名写回竞态丢数据 + HMR 只刷新第一个 | [include/src/index.ts:332](../../vendor/include/src/index.ts#L332) |
+| M7 | 自销毁持久化把 `disabled: !!js` 改写为字面量,破坏 README #18 声明的写回契约;`_disabled()` 无记忆化,副作用表达式得非确定性挂载 | [loader/src/index.ts:155-156](../../vendor/loader/src/index.ts#L155-L156) |
+| M8 | Windows 盘符大小写 → 同文件双模块实例,模块级状态分裂,HMR 只刷一侧 | [tree.ts:145-162](../../vendor/loader/src/config/tree.ts#L145-L162) |
+| M9 | 日志零终端消毒:OSC 52 剪贴板写序列、裸 `\r` 同行覆写、退格全部原样进终端 | [logger.ts:109-131](../../vendor/cordis/src/logger.ts#L109-L131) |
+| M10 | schemastery loose 返回共享可变默认值引用(跨调用污染)+ transform 回调双重调用 | [index.ts:489-494](../../vendor/schemastery/src/index.ts#L489-L494)、[797-813](../../vendor/schemastery/src/index.ts#L797-L813) |
+| M11 | union 回溯携带副作用(成员原地改输入不回滚)+ 错误信息 `JSON.stringify` 遇 BigInt/循环引用自身抛错 + 收集的失败原因被静默丢弃 | [index.ts:765-790](../../vendor/schemastery/src/index.ts#L765-L790) |
+| M12 | 嵌套 union 指数回溯 DoS:depth 9(262k 路径)21s,depth 14 >120s 无响应 | [index.ts:765-775](../../vendor/schemastery/src/index.ts#L765-L775) |
+| M13 | `Inject.resolve` 静默丢弃依赖:原型链继承键(无 checkProto)与 symbol 键被 `Object.keys` 忽略 → fiber 假 ACTIVE 回调提前执行 | [registry.ts:77-86](../../vendor/cordis/src/registry.ts#L77-L86) |
+| M14 | cosmokit `deepEqual` 把任意 Map/Set/DataView 判相等(schemastery `const` 会静默替换;loader diff 漏报变更);`clone` 把 Map/Set 克隆成首用即抛的废对象 | [types.ts:141](../../vendor/cosmokit/src/types.ts#L141)、[105](../../vendor/cosmokit/src/types.ts#L105) |
+
+### Low(择要)
+
+- 栈拼接可被构造的 `reason.stack` 误导(吞帧/无头栈,[utils.ts:253-263](../../vendor/cordis/src/utils.ts#L253-L263));约 10 万行栈 spread 触发**不可捕获**的进程硬崩溃([utils.ts:262](../../vendor/cordis/src/utils.ts#L262))
+- `ctx.root.fiber = X` 被静默接受 + 伪造父链二环 → `fiber.name` 同步死循环([reflect.ts:181](../../vendor/cordis/src/reflect.ts#L181))
+- root ctx 属性读硬编码 strict=false:provider 失败窗口内 `app.x` 与 `app.get(x)` 不一致([reflect.ts:152](../../vendor/cordis/src/reflect.ts#L152))
+- PENDING fiber 上 `ctx.provide()` 抛裸 TypeError;accessor set 返回 falsish 报错难懂
+- timer 回调抛错 → 进程级 uncaughtException(app-boot 未装该处理器);interval 迭代器并发 next 悬挂前一个;throttle dispose 后仍执行 leading
+- patch 行 null 直接 TypeError 崩溃;未知键静默写入并持久化;数字 id 类型漂移静默失配;`cordis:` 未知 builtin 诊断错位
+- YAML 标量别名写回内联放大(2KB 源 → 2MB 落盘)
+- `isBuildFailure` 空 errors 数组判真后构建失败被静默吞掉([hmr/error.ts:6-19](../../vendor/hmr/src/error.ts#L6))
+- schemastery:simplify 三类丢数据;deprecated/i18n 原地污染源 meta;NaN/Infinity 穿透 number schema;bitset 值/键不一致;fromJSON 静默产出废 schema
+- logger-console:`maxLength` NaN/0/负值通过校验并毁掉日志;截断切断代理对;ANSI 截断丢 reset
+
+### Info/证伪亮点
+
+- **证伪了一批假设**:YAML 合并键 `<<:` 无法伪造继承(fail loud);别名炸弹解析侧无放大(仅写回内联);重复键抛错;`__proto__` YAML 键不污染原型;UNC/绝对路径 entry fail loud;`registerConfig` 双注册抛错;epoch `:` 拼接无歧义(单射);DisposableList 迭代中变异安全(Map 语义)
+- `bin.js` 权限面:不解析 argv,读 cwd 的 cordis.yml(插件运行器预期语义),未构建树 fail loud
+- timer 无 unref,全部保活(长驻 CLI 无影响)
+
+## 可达性分析结论(红线队)
+
+**确认的攻击链(前提 → 落点)**:
+
+1. **模型 → 宿主进程 RCE**(条件:opt-in web-cordis 组合装载 tool-cordis):`cordis_define` 提交任意代码,语法预检后 `cordis_run` **host-only 包直接 activate 无审批**(client 包才审批——不对称),vm 沙箱注入宿主闭包 `btoa/atob`,实测 `btoa.constructor('return typeof process')()` 可达宿主 realm。文档自认「not containment」,属已声明的信任姿态,但 host-only 无审批值得复核。
+2. **模型 → worker Node 代码**(默认组合即有):workflow `script` → `vm.Script` + 注入冻结宿主函数 → 同样 constructor 逃逸(独立 worker 线程、env 清空、可 terminate;README 明示 bash 等权)。
+3. **模型 → worker**(env 门控 `DSH_TOOLS_MODE`):code-runtime `run_code`,隔离最完整(worker、env:{}、heap 上限、消息逐字段重建)。
+4. **文件 → 宿主 RCE**(设计如此):patch/preset YAML 的 `!!js` = shell 权限;断链点是 fs 沙箱 workspace-write 拒写 `$DSH_HOME`。
+5. **模型 → HMR → 宿主 realm**(仅 dev 源码检出):模型改被挂载的 include 或插件 .ts → 重读求值/重挂 fiber;安装态插件在 node_modules(被 ignore)不可达。
+
+**关键断链点强度**:fs/bash 沙箱(强,TOCTOU 重解析);审批服务(fail-closed 但只覆盖主动 ask 的调用方——工具默认不 ask);wire 层(apiproxy JSON 栅栏、preset copy-only、SDK 封闭方法表;**但 webserver `host: 0.0.0.0` 配置下文档声称 loopback-only 的特权方法对全网裸奔,无 token**)。
+
+**B 原语(schemastery RCE)**:消费端实锤(schema-form `rehydrateSchema`),但断链是「无生产者」(toJSON 丢函数)而非消费端防御——任何未来代码把 wire/盘上 JSON 直接 `new Schema()` 即复活。
+
+**最小代价加固建议**(红线队):① cordis_run host-only 分支补审批;② schema-form rehydrate 前剥 callback 字段(把断链从「无生产者」升级为「消费端免疫」);③ webserver 拒绝非 loopback 绑定或强制 token;④ headless stdout 复用终端消毒;⑤ workflow host onMessage 逐字段重建对齐 code-runtime。
+
+## 端到端裁决(第三波:完整装配验证,修正第二波结论)
+
+用真实 chokidar + Include + HMR + registerConfig 的最小完整装配(复刻 app-boot 挂载序列,`%TEMP%\dsh-e2e\`)裁决遗留项:
+
+| 待验证项 | 裁决 | 修正后的结论 |
+|---|---|---|
+| C1(包装句柄脱同步)的现实表现 | ✅ 成立,**表现修正** | 不是「双执行」:每次配置更新本身平衡(1 dispose + 1 exec)。真实危害 = **每次 HMR 模块重载静默回滚配置**:`partialReload` 的 `reload()` 用 `oldFiber._config` 重建,而真实 fiber 的 `_config` 从未被 wrapper 更新 → 插件重启到「上次模块加载时」的配置;终态文件/entry.options/运行中三态分叉,无任何日志。`internal/status` 还会携带 wrapper 而非真实 fiber |
+| H1(Windows 嵌套 ignore) | ⚠️ 条件成立,**后果修正** | 嵌套 `pkg\node_modules`、`x\.git` 确实逃逸 ignore;缓存驱逐混杂属实(同进程新旧模块并存,0 插件重载,无提示)。但 **`loader.exit()` 全量重启不可达**——externals 构建即排除 node_modules。顶层 node_modules 目录级匹配仍生效(仅嵌套泄漏)。根因精确化:chokidar v4 只对字符串型 ignored 归一化路径,函数型收到原始 Windows 绝对路径 |
+| L11(include 拼写不刷新) | ✅ 成立 | 大小写路径两条链(主 watcher、registerConfig)都静默永久失效:hmr/change 事件到达但拼写比对跳过。`.YML` 扩展名大小写则在构造时 fail loud。8.3 短名本机无生成不可测(机制同构) |
+| EMFILE/chokidar error 降级 | ❌ 不成立 | 注入 error 事件后双 watcher 存活且功能完整(模块热重载、补丁刷新均正常)。真实句柄耗尽在 Windows 不可制造,保留为纯理论风险 |
+| M6(双 Include 同文件 + HMR) | ✅ 成立 | 仅第一个 include 刷新,第二个静默永久 stale(数据持续分叉到进程重启)。registerConfig 对同文件二次注册会 fail loud——静默的只有主 watcher 路径 |
+| H2(epoch 假恢复)真实可达性 | ❌ 不成立(loader 场景) | 三条真实替换路径(入口 name 替换、模块 HMR、同 fiber 配置重启)全部正确恢复:provide 的清理器删 store 后**同步 notify**,consumer epoch 必经 INACTIVE 再回来,早退条件不可能跨过。降级为理论项(仅手工绕过 dispose-notify 偷换 impl 可达) |
+
+**装配过程的新发现**:
+
+1. **函数声明形插件的 disposer 被静默丢弃**:`export default function f(ctx,cfg){ return () => {} }` 因 `isConstructor` 为真走 `new` 路径,返回的函数被当实例,disposer 从不注册、无警告——teardown 永不执行。上游同构。方法论影响:任何「执行/teardown 失衡」测量必须先用箭头函数插件排除干扰。
+2. **C1 叠加 noSave 语义**:补丁链 `entry.update(config, true)` 跳过持久化写回 → 文件保持原始内容,叠加 HMR 回滚后「文件=1 / entry.options=5 / 运行中=1」三态分叉。
+3. `registerConfig` 初始扫描必然触发一次回调(`ignoreInitial:false`,app-boot 依赖它首挂)——计数类测试需扣除。
