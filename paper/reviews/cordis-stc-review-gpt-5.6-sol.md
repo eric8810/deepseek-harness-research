@@ -78,4 +78,4 @@ Cordis 的前景取决于它能否继续缩小形式语义与系统边界之间�
 
 ## 阅读过程说明
 
-我按论文分页阅读了 [cordis-spatiotemporal-composability.verified.md](../cordis-spatiotemporal-composability.verified.md) 的全部内容，实际覆盖第 1–2534 行；最后一页读到第 2534 行，即参考文献 [124] 的末行，确认没有停在摘要、正文结论或相关工作之前。为理解论文与真实 Cordis 系统的关系，另行阅读了 [vendor/README.md](../../vendor/README.md)。
+我按论文分页阅读了 [cordis-spatiotemporal-composability.verified.md](../cordis-spatiotemporal-composability.verified.md) 的全部内容，实际覆盖第 1–2534 行；最后一页读到第 2534 行，即参考文献 [124] 的末行，确认没有停在摘要、正文结论或相关工作之前。为理解论文与真实 Cordis 系统的关系，另行阅读了 [vendor/README.md](../../../../vendor/README.md)。

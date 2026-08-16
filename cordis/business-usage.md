@@ -1,6 +1,6 @@
 # Cordis 业务层使用地图:harness 如何用 Cordis
 
-> 承接 [cordis-core-model.md](cordis-core-model.md)(框架机制)。本笔记回答业务层问题:插件树怎么拼出来、业务插件长什么样、模块间的依赖设计与接入设计。依据:`packages/bundle/*`、`packages/boot/app-boot/src/profile.ts`、`packages/todo/tool-todo/src/index.ts`。
+> 承接 [core-model.md](core-model.md)(框架机制)。本笔记回答业务层问题:插件树怎么拼出来、业务插件长什么样、模块间的依赖设计与接入设计。依据:`packages/bundle/*`、`packages/boot/app-boot/src/profile.ts`、`packages/todo/tool-todo/src/index.ts`。
 
 ## 一、组合管线:从空树到运行的插件树
 

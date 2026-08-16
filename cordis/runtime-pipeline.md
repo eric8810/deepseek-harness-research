@@ -1,6 +1,6 @@
 # Cordis 运行时管线:工具执行与 turn flow
 
-> 承接 [cordis-core-model.md](cordis-core-model.md)(机制)、[cordis-business-usage.md](business-usage.md)(使用)、[cordis-design-rationale.md](design-rationale.md)(意图)。本笔记回答「拼好之后,数据在机器里怎么流」:一次工具调用经过哪几道门、为什么这么分、循环如何驱动。官方出处:[tool-execution-pipeline](../../tool-execution-pipeline.md)、[agent-lifecycle](../../agent-lifecycle.md)、`packages/core/tools/src/index.ts`。
+> 承接 [core-model.md](core-model.md)(机制)、[business-usage.md](business-usage.md)(使用)、[design-rationale.md](design-rationale.md)(意图)。本笔记回答「拼好之后,数据在机器里怎么流」:一次工具调用经过哪几道门、为什么这么分、循环如何驱动。官方出处:[tool-execution-pipeline](../../tool-execution-pipeline.md)、[agent-lifecycle](../../agent-lifecycle.md)、`packages/core/tools/src/index.ts`。
 
 ## 一、一次工具调用的五道门
 

@@ -1,6 +1,6 @@
 # Agent Loop:驱动循环的解剖
 
-> 承接 [cordis-runtime-pipeline.md](runtime-pipeline.md)(工具管线与 turn flow)。本笔记回答 loop 本身怎么运作、依赖哪些内容、为什么不依赖其他内容。依据:`packages/core/agent-loop/src/{index,agent,tool-calls}.ts`、`docs/subsystems/core.md`、`docs/agent-lifecycle.md`。
+> 承接 [runtime-pipeline.md](runtime-pipeline.md)(工具管线与 turn flow)。本笔记回答 loop 本身怎么运作、依赖哪些内容、为什么不依赖其他内容。依据:`packages/core/agent-loop/src/{index,agent,tool-calls}.ts`、`docs/subsystems/core.md`、`docs/agent-lifecycle.md`。
 
 ## 一、依赖清单:inject 声明就是全部答案
 

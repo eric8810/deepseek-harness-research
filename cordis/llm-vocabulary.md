@@ -1,6 +1,6 @@
 # LLM 缝:数据结构与词汇表
 
-> 承接 [cordis-agent-loop.md](agent-loop.md)(循环)。本笔记聚焦 LLM 缝的数据结构:`packages/llm/llm/src/{types,message}.ts` 定义的 harness 词汇表,以及服务面的请求/注册结构。官方出处:`docs/subsystems/llm-streaming.md`。
+> 承接 [agent-loop.md](agent-loop.md)(循环)。本笔记聚焦 LLM 缝的数据结构:`packages/llm/llm/src/{types,message}.ts` 定义的 harness 词汇表,以及服务面的请求/注册结构。官方出处:`docs/subsystems/llm-streaming.md`。
 
 ## 一、三个 merge-extensible 联合
 

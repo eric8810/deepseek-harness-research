@@ -1,6 +1,6 @@
 # Agent Framework 设计意图:从使用代码反推业务设计逻辑
 
-> 承接 [cordis-core-model.md](cordis-core-model.md)(机制)与 [cordis-business-usage.md](business-usage.md)(使用)。本笔记回答「为什么这么设计」:从 base bundle 行、tool-todo、plan-mode、agent-loop、extensions 等使用代码反推十条设计原则,以及插件的存在意义、价值与相互关系。
+> 承接 [core-model.md](core-model.md)(机制)与 [business-usage.md](business-usage.md)(使用)。本笔记回答「为什么这么设计」:从 base bundle 行、tool-todo、plan-mode、agent-loop、extensions 等使用代码反推十条设计原则,以及插件的存在意义、价值与相互关系。
 >
 > 本笔记是官方文档的**反向推导伴侣**,不是权威:每条原则末尾的「官方依据」链接到它的原始出处(Agent Notes 与架构文档),不一致时以官方为准。
 
